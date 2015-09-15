@@ -1,84 +1,85 @@
-package client
+	package client
 
-import (
-	"bytes"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io/ioutil"
-	"net"
-	"net/http"
-	"net/url"
-	"strconv"
-	"strings"
-	"time"
+	import (
+		"bytes"
+		"encoding/json"
+		"errors"
+		"fmt"
+		"io/ioutil"
+		"net"
+		"net/http"
+		"net/url"
+		"strconv"
+		"strings"
+		"time"
 
-	"github.com/influxdb/influxdb/models"
-)
+		"github.com/influxdb/influxdb/models"
+	)
 
-const (
-	// DefaultHost is the default host used to connect to an InfluxDB instance
-	DefaultHost = "localhost"
+	const (
+		// DefaultHost is the default host used to connect to an InfluxDB instance
+		DefaultHost = "localhost"
 
-	// DefaultPort is the default port used to connect to an InfluxDB instance
-	DefaultPort = 8086
+		// DefaultPort is the default port used to connect to an InfluxDB instance
+		DefaultPort = 8086
 
-	// DefaultTimeout is the default connection timeout used to connect to an InfluxDB instance
-	DefaultTimeout = 0
-)
+		// DefaultTimeout is the default connection timeout used to connect to an InfluxDB instance
+		DefaultTimeout = 0
+	)
 
-// Query is used to send a command to the server. Both Command and Database are required.
-type Query struct {
-	Command  string
-	Database string
-}
+	// Query is used to send a command to the server. Both Command and Database are required.
+	type Query struct {
+		Command  string
+		Database string
+	}
 
-// ParseConnectionString will parse a string to create a valid connection URL
-func ParseConnectionString(path string, ssl bool) (url.URL, error) {
-	var host string
-	var port int
+	// ParseConnectionString will parse a string to create a valid connection URL
+	func ParseConnectionString(path string, ssl bool) (url.URL, error) {
+		var host string
+		var port int
 
-	if strings.Contains(path, ":") {
-		h := strings.Split(path, ":")
-		i, e := strconv.Atoi(h[1])
-		if e != nil {
-			return url.URL{}, fmt.Errorf("invalid port number %q: %s\n", path, e)
-		}
-		port = i
-		if h[0] == "" {
-			host = DefaultHost
+		if strings.Contains(path, ":") {
+			h := strings.Split(path, ":")
+			i, e := strconv.Atoi(h[1])
+			if e != nil {
+				return url.URL{}, fmt.Errorf("invalid port number %q: %s\n", path, e)
+			}
+			port = i
+			if h[0] == "" {
+				host = DefaultHost
+			} else {
+				host = h[0]
+			}
 		} else {
-			host = h[0]
+			host = path
+			// If they didn't specify a port, always use the default port
+			port = DefaultPort
 		}
-	} else {
-		host = path
-		// If they didn't specify a port, always use the default port
-		port = DefaultPort
+
+		u := url.URL{
+			Scheme: "http",
+		}
+		if ssl {
+			u.Scheme = "https"
+		}
+		u.Host = net.JoinHostPort(host, strconv.Itoa(port))
+
+		return u, nil
 	}
 
-	u := url.URL{
-		Scheme: "http",
-	}
-	if ssl {
-		u.Scheme = "https"
-	}
-	u.Host = net.JoinHostPort(host, strconv.Itoa(port))
-
-	return u, nil
-}
-
-// Config is used to specify what server to connect to.
-// URL: The URL of the server connecting to.
-// Username/Password are optional.  They will be passed via basic auth if provided.
-// UserAgent: If not provided, will default "InfluxDBClient",
-// Timeout: If not provided, will default to 0 (no timeout)
-type Config struct {
-	URL       url.URL
-	Username  string
-	Password  string
-	UserAgent string
-	Timeout   time.Duration
-	Precision string
+	// Config is used to specify what server to connect to.
+	// URL: The URL of the server connecting to.
+	// Username/Password are optional.  They will be passed via basic auth if provided.
+	// UserAgent: If not provided, will default "InfluxDBClient",
+	// Timeout: If not provided, will default to 0 (no timeout)
+	type Config struct {
+		URL       url.URL
+		Username  string
+		Password  string
+		UserAgent string
+		Timeout   time.Duration
+		Precision string
+		HttpClient *http.Client
 }
 
 // NewConfig will create a config to be used in connecting to the client
@@ -111,9 +112,14 @@ func NewClient(c Config) (*Client, error) {
 		url:        c.URL,
 		username:   c.Username,
 		password:   c.Password,
-		httpClient: &http.Client{Timeout: c.Timeout},
+		httpClient: c.HttpClient,
 		userAgent:  c.UserAgent,
 		precision:  c.Precision,
+	}
+	if client.httpClient != nil {
+		client.httpClient.Timeout = c.Timeout
+	} else if client.httpClient == nil {
+		client.httpClient = &http.Client{Timeout: c.Timeout}
 	}
 	if client.userAgent == "" {
 		client.userAgent = "InfluxDBClient"
