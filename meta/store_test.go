@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -151,7 +152,7 @@ func TestStore_DeleteNode(t *testing.T) {
 	}
 
 	// Remove second node.
-	if err := s.DeleteNode(3); err != nil {
+	if err := s.DeleteNode(3, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -173,7 +174,7 @@ func TestStore_DeleteNode_ErrNodeNotFound(t *testing.T) {
 	s := MustOpenStore()
 	defer s.Close()
 
-	if err := s.DeleteNode(2); err != meta.ErrNodeNotFound {
+	if err := s.DeleteNode(2, false); err != meta.ErrNodeNotFound {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -649,6 +650,90 @@ func TestStore_DropContinuousQuery(t *testing.T) {
 	}
 }
 
+// Ensure the store can create a new subscription.
+func TestStore_CreateSubscription(t *testing.T) {
+	t.Parallel()
+	s := MustOpenStore()
+	defer s.Close()
+
+	// Create subscription.
+	rpi := &meta.RetentionPolicyInfo{
+		Name:     "rp0",
+		ReplicaN: 3,
+	}
+	if _, err := s.CreateDatabase("db0"); err != nil {
+		t.Fatal(err)
+	} else if _, err := s.CreateRetentionPolicy("db0", rpi); err != nil {
+		t.Fatal(err)
+	} else if err := s.CreateSubscription("db0", "rp0", "s0", "t0", []string{"h0", "h1"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Ensure that creating an existing subscription returns an error.
+func TestStore_CreateSubscription_ErrSubscriptionExists(t *testing.T) {
+	t.Parallel()
+	s := MustOpenStore()
+	defer s.Close()
+
+	// Create subscription.
+	rpi := &meta.RetentionPolicyInfo{
+		Name:     "rp0",
+		ReplicaN: 3,
+	}
+	if _, err := s.CreateDatabase("db0"); err != nil {
+		t.Fatal(err)
+	} else if _, err := s.CreateRetentionPolicy("db0", rpi); err != nil {
+		t.Fatal(err)
+	} else if err := s.CreateSubscription("db0", "rp0", "s0", "t0", []string{"h0", "h1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create it again.
+	if err := s.CreateSubscription("db0", "rp0", "s0", "t0", []string{"h0", "h1"}); err != meta.ErrSubscriptionExists {
+		t.Fatalf("unexpected error: %s", err)
+	}
+}
+
+// Ensure the store can delete a subscription.
+func TestStore_DropSubscription(t *testing.T) {
+	t.Parallel()
+	s := MustOpenStore()
+	defer s.Close()
+
+	// Create subscription.
+	rpi := &meta.RetentionPolicyInfo{
+		Name:     "rp0",
+		ReplicaN: 3,
+	}
+	if _, err := s.CreateDatabase("db0"); err != nil {
+		t.Fatal(err)
+	} else if _, err := s.CreateRetentionPolicy("db0", rpi); err != nil {
+		t.Fatal(err)
+	} else if err := s.CreateSubscription("db0", "rp0", "s0", "ANY", []string{"udp://h0:1234", "udp://h1:1234"}); err != nil {
+		t.Fatal(err)
+	} else if err := s.CreateSubscription("db0", "rp0", "s1", "ALL", []string{"udp://h0:1234", "udp://h1:1234"}); err != nil {
+		t.Fatal(err)
+	} else if err := s.CreateSubscription("db0", "rp0", "s2", "ANY", []string{"udp://h0:1234", "udp://h1:1234"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove one of the subscriptions.
+	if err := s.DropSubscription("db0", "rp0", "s0"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure the resulting subscriptions are correct.
+	if rpi, err := s.RetentionPolicy("db0", "rp0"); err != nil {
+		t.Fatal(err)
+	} else if !reflect.DeepEqual(rpi.Subscriptions, []meta.SubscriptionInfo{
+		{Name: "s1", Mode: "ALL", Destinations: []string{"udp://h0:1234", "udp://h1:1234"}},
+		{Name: "s2", Mode: "ANY", Destinations: []string{"udp://h0:1234", "udp://h1:1234"}},
+	}) {
+		t.Fatalf("unexpected subscriptions: %#v", rpi.Subscriptions)
+	}
+}
+
 // Ensure the store can create a user.
 func TestStore_CreateUser(t *testing.T) {
 	t.Parallel()
@@ -957,6 +1042,17 @@ func TestCluster_Restart(t *testing.T) {
 
 	// ensure all the nodes see the same metastore data
 	assertDatabaseReplicated(t, c)
+	var wg sync.WaitGroup
+	wg.Add(len(c.Stores))
+	for _, s := range c.Stores {
+		go func(s *Store) {
+			defer wg.Done()
+			if err := s.Close(); err != nil {
+				t.Fatalf("error closing store %s", err)
+			}
+		}(s)
+	}
+	wg.Wait()
 }
 
 // Store is a test wrapper for meta.Store.
@@ -973,7 +1069,9 @@ func NewStore(c *meta.Config) *Store {
 	s := &Store{
 		Store: meta.NewStore(c),
 	}
-	s.Logger = log.New(&s.Stderr, "", log.LstdFlags)
+	if !testing.Verbose() {
+		s.Logger = log.New(&s.Stderr, "", log.LstdFlags)
+	}
 	s.SetHashPasswordFn(mockHashPassword)
 	return s
 }
@@ -1135,9 +1233,16 @@ func (c *Cluster) Open() error {
 
 // Close shuts down all stores.
 func (c *Cluster) Close() error {
+	var wg sync.WaitGroup
+	wg.Add(len(c.Stores))
+
 	for _, s := range c.Stores {
-		s.Close()
+		go func(s *Store) {
+			defer wg.Done()
+			s.Close()
+		}(s)
 	}
+	wg.Wait()
 	return nil
 }
 

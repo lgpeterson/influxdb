@@ -46,11 +46,22 @@ type QueryExecutor struct {
 		CreateMapper(shard meta.ShardInfo, stmt influxql.Statement, chunkSize int) (Mapper, error)
 	}
 
+	IntoWriter interface {
+		WritePointsInto(p *IntoWriteRequest) error
+	}
+
 	Logger          *log.Logger
 	QueryLogEnabled bool
 
 	// the local data store
 	Store *Store
+}
+
+// partial copy of cluster.WriteRequest
+type IntoWriteRequest struct {
+	Database        string
+	RetentionPolicy string
+	Points          []models.Point
 }
 
 // NewQueryExecutor returns an initialized QueryExecutor
@@ -159,7 +170,7 @@ func (q *QueryExecutor) ExecuteQuery(query *influxql.Query, database string, chu
 			var res *influxql.Result
 			switch stmt := stmt.(type) {
 			case *influxql.SelectStatement:
-				if err := q.executeSelectStatement(i, stmt, results, chunkSize); err != nil {
+				if err := q.executeStatement(i, stmt, database, results, chunkSize); err != nil {
 					results <- &influxql.Result{Err: err}
 					break
 				}
@@ -172,12 +183,15 @@ func (q *QueryExecutor) ExecuteQuery(query *influxql.Query, database string, chu
 				// TODO: handle this in a cluster
 				res = q.executeDropMeasurementStatement(stmt, database)
 			case *influxql.ShowMeasurementsStatement:
-				if err := q.executeShowMeasurementsStatement(i, stmt, database, results, chunkSize); err != nil {
+				if err := q.executeStatement(i, stmt, database, results, chunkSize); err != nil {
 					results <- &influxql.Result{Err: err}
 					break
 				}
 			case *influxql.ShowTagKeysStatement:
-				res = q.executeShowTagKeysStatement(stmt, database)
+				if err := q.executeStatement(i, stmt, database, results, chunkSize); err != nil {
+					results <- &influxql.Result{Err: err}
+					break
+				}
 			case *influxql.ShowTagValuesStatement:
 				res = q.executeShowTagValuesStatement(stmt, database)
 			case *influxql.ShowFieldKeysStatement:
@@ -220,6 +234,7 @@ func (q *QueryExecutor) ExecuteQuery(query *influxql.Query, database string, chu
 
 // Plan creates an execution plan for the given SelectStatement and returns an Executor.
 func (q *QueryExecutor) PlanSelect(stmt *influxql.SelectStatement, chunkSize int) (Executor, error) {
+	var shardIDs []uint64
 	shards := map[uint64]meta.ShardInfo{} // Shards requiring mappers.
 
 	// It is important to "stamp" this time so that everywhere we evaluate `now()` in the statement is EXACTLY the same `now`
@@ -249,14 +264,22 @@ func (q *QueryExecutor) PlanSelect(stmt *influxql.SelectStatement, chunkSize int
 		}
 		for _, g := range shardGroups {
 			for _, sh := range g.Shards {
-				shards[sh.ID] = sh
+				if _, ok := shards[sh.ID]; !ok {
+					shards[sh.ID] = sh
+					shardIDs = append(shardIDs, sh.ID)
+				}
 			}
 		}
 	}
 
+	// Sort shard IDs to make testing deterministic.
+	sort.Sort(uint64Slice(shardIDs))
+
 	// Build the Mappers, one per shard.
 	mappers := []Mapper{}
-	for _, sh := range shards {
+	for _, shardID := range shardIDs {
+		sh := shards[shardID]
+
 		m, err := q.ShardMapper.CreateMapper(sh, stmt, chunkSize)
 		if err != nil {
 			return nil, err
@@ -268,36 +291,16 @@ func (q *QueryExecutor) PlanSelect(stmt *influxql.SelectStatement, chunkSize int
 		mappers = append(mappers, m)
 	}
 
-	executor := NewSelectExecutor(stmt, mappers, chunkSize)
-	return executor, nil
-}
+	// Certain operations on the SELECT statement can be performed by the AggregateExecutor without
+	// assistance from the Mappers. This allows the AggregateExecutor to prepare aggregation functions
+	// and mathematical functions.
+	stmt.RewriteDistinct()
 
-// executeSelectStatement plans and executes a select statement against a database.
-func (q *QueryExecutor) executeSelectStatement(statementID int, stmt *influxql.SelectStatement, results chan *influxql.Result, chunkSize int) error {
-	// Plan statement execution.
-	e, err := q.PlanSelect(stmt, chunkSize)
-	if err != nil {
-		return err
+	if (stmt.IsRawQuery && !stmt.HasDistinct()) || stmt.IsSimpleDerivative() {
+		return NewRawExecutor(stmt, mappers, chunkSize), nil
+	} else {
+		return NewAggregateExecutor(stmt, mappers), nil
 	}
-
-	// Execute plan.
-	ch := e.Execute()
-
-	// Stream results from the channel. We should send an empty result if nothing comes through.
-	resultSent := false
-	for row := range ch {
-		if row.Err != nil {
-			return row.Err
-		}
-		resultSent = true
-		results <- &influxql.Result{StatementID: statementID, Series: []*models.Row{row}}
-	}
-
-	if !resultSent {
-		results <- &influxql.Result{StatementID: statementID, Series: make([]*models.Row, 0)}
-	}
-
-	return nil
 }
 
 // expandSources expands regex sources and removes duplicates.
@@ -379,12 +382,17 @@ func (q *QueryExecutor) executeDropDatabaseStatement(stmt *influxql.DropDatabase
 		}
 	}
 
+	// Remove database from meta-store first so that in-flight writes can complete without error, but new ones will
+	// be rejected.
+	res := q.MetaStatementExecutor.ExecuteStatement(stmt)
+
+	// Remove the database from the local store
 	err = q.Store.DeleteDatabase(stmt.Name, shardIDs)
 	if err != nil {
 		return &influxql.Result{Err: err}
 	}
 
-	return q.MetaStatementExecutor.ExecuteStatement(stmt)
+	return res
 }
 
 // executeDropMeasurementStatement removes the measurement and all series data from the local store for the given measurement
@@ -413,6 +421,11 @@ func (q *QueryExecutor) executeDropMeasurementStatement(stmt *influxql.DropMeasu
 
 // executeDropSeriesStatement removes all series from the local store that match the drop query
 func (q *QueryExecutor) executeDropSeriesStatement(stmt *influxql.DropSeriesStatement, database string) *influxql.Result {
+	// Check for time in WHERE clause (not supported).
+	if influxql.HasTimeExpr(stmt.Condition) {
+		return &influxql.Result{Err: errors.New("DROP SERIES doesn't support time in WHERE clause")}
+	}
+
 	// Find the database.
 	db := q.Store.DatabaseIndex(database)
 	if db == nil {
@@ -423,6 +436,8 @@ func (q *QueryExecutor) executeDropSeriesStatement(stmt *influxql.DropSeriesStat
 	sources, err := q.expandSources(stmt.Sources)
 	if err != nil {
 		return &influxql.Result{Err: err}
+	} else if stmt.Sources != nil && len(stmt.Sources) != 0 && len(sources) == 0 {
+		return &influxql.Result{}
 	}
 
 	measurements, err := measurementsFromSourcesOrDB(db, sources...)
@@ -433,11 +448,22 @@ func (q *QueryExecutor) executeDropSeriesStatement(stmt *influxql.DropSeriesStat
 	var seriesKeys []string
 	for _, m := range measurements {
 		var ids SeriesIDs
+		var filters FilterExprs
 		if stmt.Condition != nil {
 			// Get series IDs that match the WHERE clause.
-			ids, _, err = m.walkWhereForSeriesIds(stmt.Condition)
+			ids, filters, err = m.walkWhereForSeriesIds(stmt.Condition)
 			if err != nil {
 				return &influxql.Result{Err: err}
+			}
+
+			// Delete boolean literal true filter expressions.
+			// These are returned for `WHERE tagKey = 'tagVal'` type expressions and are okay.
+			filters.DeleteBoolLiteralTrues()
+
+			// Check for unsupported field filters.
+			// Any remaining filters means there were fields (e.g., `WHERE value = 1.2`).
+			if filters.Len() > 0 {
+				return &influxql.Result{Err: errors.New("DROP SERIES doesn't support fields in WHERE clause")}
 			}
 		} else {
 			// No WHERE clause so get all series IDs for this measurement.
@@ -460,6 +486,11 @@ func (q *QueryExecutor) executeDropSeriesStatement(stmt *influxql.DropSeriesStat
 }
 
 func (q *QueryExecutor) executeShowSeriesStatement(stmt *influxql.ShowSeriesStatement, database string) *influxql.Result {
+	// Check for time in WHERE clause (not supported).
+	if influxql.HasTimeExpr(stmt.Condition) {
+		return &influxql.Result{Err: errors.New("SHOW SERIES doesn't support time in WHERE clause")}
+	}
+
 	// Find the database.
 	db := q.Store.DatabaseIndex(database)
 	if db == nil {
@@ -486,20 +517,27 @@ func (q *QueryExecutor) executeShowSeriesStatement(stmt *influxql.ShowSeriesStat
 	// Loop through measurements to build result. One result row / measurement.
 	for _, m := range measurements {
 		var ids SeriesIDs
+		var filters FilterExprs
 
 		if stmt.Condition != nil {
 			// Get series IDs that match the WHERE clause.
-			ids, _, err = m.walkWhereForSeriesIds(stmt.Condition)
+			ids, filters, err = m.walkWhereForSeriesIds(stmt.Condition)
 			if err != nil {
 				return &influxql.Result{Err: err}
+			}
+
+			// Delete boolean literal true filter expressions.
+			filters.DeleteBoolLiteralTrues()
+
+			// Check for unsupported field filters.
+			if filters.Len() > 0 {
+				return &influxql.Result{Err: errors.New("SHOW SERIES doesn't support fields in WHERE clause")}
 			}
 
 			// If no series matched, then go to the next measurement.
 			if len(ids) == 0 {
 				continue
 			}
-
-			// TODO: check return of walkWhereForSeriesIds for fields
 		} else {
 			// No WHERE clause so get all series IDs for this measurement.
 			ids = m.seriesIDs
@@ -570,8 +608,26 @@ func (q *QueryExecutor) filterShowSeriesResult(limit, offset int, rows models.Ro
 	return filteredSeries
 }
 
-// PlanShowMeasurements creates an execution plan for the given SelectStatement and returns an Executor.
+func (q *QueryExecutor) planStatement(stmt influxql.Statement, database string, chunkSize int) (Executor, error) {
+	switch stmt := stmt.(type) {
+	case *influxql.SelectStatement:
+		return q.PlanSelect(stmt, chunkSize)
+	case *influxql.ShowMeasurementsStatement:
+		return q.PlanShowMeasurements(stmt, database, chunkSize)
+	case *influxql.ShowTagKeysStatement:
+		return q.PlanShowTagKeys(stmt, database, chunkSize)
+	default:
+		return nil, fmt.Errorf("can't plan statement type: %v", stmt)
+	}
+}
+
+// PlanShowMeasurements creates an execution plan for a SHOW TAG KEYS statement and returns an Executor.
 func (q *QueryExecutor) PlanShowMeasurements(stmt *influxql.ShowMeasurementsStatement, database string, chunkSize int) (Executor, error) {
+	// Check for time in WHERE clause (not supported).
+	if influxql.HasTimeExpr(stmt.Condition) {
+		return nil, errors.New("SHOW MEASUREMENTS doesn't support time in WHERE clause")
+	}
+
 	// Get the database info.
 	di, err := q.MetaStore.Database(database)
 	if err != nil {
@@ -601,24 +657,92 @@ func (q *QueryExecutor) PlanShowMeasurements(stmt *influxql.ShowMeasurementsStat
 	return executor, nil
 }
 
-func (q *QueryExecutor) executeShowMeasurementsStatement(statementID int, stmt *influxql.ShowMeasurementsStatement, database string, results chan *influxql.Result, chunkSize int) error {
+// PlanShowTagKeys creates an execution plan for a SHOW MEASUREMENTS statement and returns an Executor.
+func (q *QueryExecutor) PlanShowTagKeys(stmt *influxql.ShowTagKeysStatement, database string, chunkSize int) (Executor, error) {
+	// Check for time in WHERE clause (not supported).
+	if influxql.HasTimeExpr(stmt.Condition) {
+		return nil, errors.New("SHOW TAG KEYS doesn't support time in WHERE clause")
+	}
+
+	// Get the database info.
+	di, err := q.MetaStore.Database(database)
+	if err != nil {
+		return nil, err
+	} else if di == nil {
+		return nil, ErrDatabaseNotFound(database)
+	}
+
+	// Get info for all shards in the database.
+	shards := di.ShardInfos()
+
+	// Build the Mappers, one per shard.
+	mappers := []Mapper{}
+	for _, sh := range shards {
+		m, err := q.ShardMapper.CreateMapper(sh, stmt, chunkSize)
+		if err != nil {
+			return nil, err
+		}
+		if m == nil {
+			// No data for this shard, skip it.
+			continue
+		}
+		mappers = append(mappers, m)
+	}
+
+	executor := NewShowTagKeysExecutor(stmt, mappers, chunkSize)
+	return executor, nil
+}
+
+func (q *QueryExecutor) executeStatement(statementID int, stmt influxql.Statement, database string, results chan *influxql.Result, chunkSize int) error {
 	// Plan statement execution.
-	e, err := q.PlanShowMeasurements(stmt, database, chunkSize)
+	e, err := q.planStatement(stmt, database, chunkSize)
 	if err != nil {
 		return err
 	}
 
 	// Execute plan.
 	ch := e.Execute()
-
+	var writeerr error
+	var intoNum int64
+	var isinto bool
 	// Stream results from the channel. We should send an empty result if nothing comes through.
 	resultSent := false
 	for row := range ch {
+		// We had a write error. Continue draining results from the channel
+		// so we don't hang the goroutine in the executor.
+		if writeerr != nil {
+			continue
+		}
 		if row.Err != nil {
 			return row.Err
 		}
-		resultSent = true
-		results <- &influxql.Result{StatementID: statementID, Series: []*models.Row{row}}
+		selectstmt, ok := stmt.(*influxql.SelectStatement)
+		if ok && selectstmt.Target != nil {
+			isinto = true
+			// this is a into query. Write results back to database
+			writeerr = q.writeInto(row, selectstmt)
+			intoNum += int64(len(row.Values))
+		} else {
+			resultSent = true
+			results <- &influxql.Result{StatementID: statementID, Series: []*models.Row{row}}
+		}
+	}
+	if writeerr != nil {
+		return writeerr
+	} else if isinto {
+		results <- &influxql.Result{
+			StatementID: statementID,
+			Series: []*models.Row{{
+				Name: "result",
+				// it seems weird to give a time here, but so much stuff breaks if you don't
+				Columns: []string{"time", "written"},
+				Values: [][]interface{}{{
+					time.Unix(0, 0).UTC(),
+					intoNum,
+				}},
+			}},
+		}
+		return nil
 	}
 
 	if !resultSent {
@@ -628,60 +752,45 @@ func (q *QueryExecutor) executeShowMeasurementsStatement(statementID int, stmt *
 	return nil
 }
 
-func (q *QueryExecutor) executeShowTagKeysStatement(stmt *influxql.ShowTagKeysStatement, database string) *influxql.Result {
-	// Find the database.
-	db := q.Store.DatabaseIndex(database)
-	if db == nil {
-		return &influxql.Result{}
+func (q *QueryExecutor) writeInto(row *models.Row, selectstmt *influxql.SelectStatement) error {
+	// It might seem a bit weird that this is where we do this, since we will have to
+	// convert rows back to points. The Executors (both aggregate and raw) are complex
+	// enough that changing them to write back to the DB is going to be clumsy
+	//
+	// it might seem weird to have the write be in the QueryExecutor, but the interweaving of
+	// limitedRowWriter and ExecuteAggregate/Raw makes it ridiculously hard to make sure that the
+	// results will be the same as when queried normally.
+	measurement := intoMeasurement(selectstmt)
+	if measurement == "" {
+		measurement = row.Name
 	}
-
-	// Expand regex expressions in the FROM clause.
-	sources, err := q.expandSources(stmt.Sources)
+	intodb, err := intoDB(selectstmt)
 	if err != nil {
-		return &influxql.Result{Err: err}
+		return err
 	}
-
-	// Get the list of measurements we're interested in.
-	measurements, err := measurementsFromSourcesOrDB(db, sources...)
+	rp := intoRP(selectstmt)
+	points, err := convertRowToPoints(measurement, row)
 	if err != nil {
-		return &influxql.Result{Err: err}
+		return err
 	}
-
-	// Make result.
-	result := &influxql.Result{
-		Series: make(models.Rows, 0, len(measurements)),
+	req := &IntoWriteRequest{
+		Database:        intodb,
+		RetentionPolicy: rp,
+		Points:          points,
 	}
-
-	// Add one row per measurement to the result.
-	for _, m := range measurements {
-		// TODO: filter tag keys by stmt.Condition
-
-		// Get the tag keys in sorted order.
-		keys := m.TagKeys()
-
-		// Convert keys to an [][]interface{}.
-		values := make([][]interface{}, 0, len(m.seriesByTagKeyValue))
-		for _, k := range keys {
-			v := interface{}(k)
-			values = append(values, []interface{}{v})
-		}
-
-		// Make a result row for the measurement.
-		r := &models.Row{
-			Name:    m.Name,
-			Columns: []string{"tagKey"},
-			Values:  values,
-		}
-
-		result.Series = append(result.Series, r)
+	err = q.IntoWriter.WritePointsInto(req)
+	if err != nil {
+		return err
 	}
-
-	// TODO: LIMIT & OFFSET
-
-	return result
+	return nil
 }
 
 func (q *QueryExecutor) executeShowTagValuesStatement(stmt *influxql.ShowTagValuesStatement, database string) *influxql.Result {
+	// Check for time in WHERE clause (not supported).
+	if influxql.HasTimeExpr(stmt.Condition) {
+		return &influxql.Result{Err: errors.New("SHOW TAG VALUES doesn't support time in WHERE clause")}
+	}
+
 	// Find the database.
 	db := q.Store.DatabaseIndex(database)
 	if db == nil {
@@ -817,7 +926,7 @@ func measurementsFromSourcesOrDB(db *DatabaseIndex, sources ...influxql.Source) 
 			if m, ok := source.(*influxql.Measurement); ok {
 				measurement := db.measurements[m.Name]
 				if measurement == nil {
-					return nil, ErrMeasurementNotFound(m.Name)
+					continue
 				}
 
 				measurements = append(measurements, measurement)
@@ -936,3 +1045,9 @@ var (
 func ErrDatabaseNotFound(name string) error { return fmt.Errorf("database not found: %s", name) }
 
 func ErrMeasurementNotFound(name string) error { return fmt.Errorf("measurement not found: %s", name) }
+
+type uint64Slice []uint64
+
+func (a uint64Slice) Len() int           { return len(a) }
+func (a uint64Slice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a uint64Slice) Less(i, j int) bool { return a[i] < a[j] }

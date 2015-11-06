@@ -1,7 +1,6 @@
 package graphite_test
 
 import (
-	"math"
 	"strconv"
 	"testing"
 	"time"
@@ -105,7 +104,7 @@ func TestTemplateApply(t *testing.T) {
 			continue
 		}
 
-		measurement, tags := tmpl.Apply(test.input)
+		measurement, tags, _, _ := tmpl.Apply(test.input)
 		if measurement != test.measurement {
 			t.Fatalf("name parse failer.  expected %v, got %v", test.measurement, measurement)
 		}
@@ -224,22 +223,9 @@ func TestParseNaN(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	pt, err := p.Parse("servers.localhost.cpu_load NaN 1435077219")
-	if err != nil {
-		t.Fatalf("parse error: %v", err)
-	}
-
-	exp := models.NewPoint("servers.localhost.cpu_load",
-		models.Tags{},
-		models.Fields{"value": math.NaN()},
-		time.Unix(1435077219, 0))
-
-	if exp.String() != pt.String() {
-		t.Errorf("parse mismatch: got %v, exp %v", pt.String(), exp.String())
-	}
-
-	if !math.IsNaN(pt.Fields()["value"].(float64)) {
-		t.Errorf("parse value mismatch: expected NaN")
+	_, err = p.Parse("servers.localhost.cpu_load NaN 1435077219")
+	if err == nil {
+		t.Fatalf("expected error. got nil")
 	}
 }
 
@@ -249,7 +235,7 @@ func TestFilterMatchDefault(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("miss.servers.localhost.cpu_load",
+	exp := models.MustNewPoint("miss.servers.localhost.cpu_load",
 		models.Tags{},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -270,7 +256,7 @@ func TestFilterMatchMultipleMeasurement(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu.cpu_load.10",
+	exp := models.MustNewPoint("cpu.cpu_load.10",
 		models.Tags{"host": "localhost"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -294,7 +280,7 @@ func TestFilterMatchMultipleMeasurementSeparator(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu_cpu_load_10",
+	exp := models.MustNewPoint("cpu_cpu_load_10",
 		models.Tags{"host": "localhost"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -315,7 +301,7 @@ func TestFilterMatchSingle(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu_load",
+	exp := models.MustNewPoint("cpu_load",
 		models.Tags{"host": "localhost"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -336,7 +322,7 @@ func TestParseNoMatch(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("servers.localhost.memory.VmallocChunk",
+	exp := models.MustNewPoint("servers.localhost.memory.VmallocChunk",
 		models.Tags{},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -357,7 +343,7 @@ func TestFilterMatchWildcard(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu_load",
+	exp := models.MustNewPoint("cpu_load",
 		models.Tags{"host": "localhost"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -380,7 +366,7 @@ func TestFilterMatchExactBeforeWildcard(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu_load",
+	exp := models.MustNewPoint("cpu_load",
 		models.Tags{"host": "localhost"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -408,7 +394,7 @@ func TestFilterMatchMostLongestFilter(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu_load",
+	exp := models.MustNewPoint("cpu_load",
 		models.Tags{"host": "localhost", "resource": "cpu"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -435,7 +421,7 @@ func TestFilterMatchMultipleWildcards(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu_load",
+	exp := models.MustNewPoint("cpu_load",
 		models.Tags{"host": "server01"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -460,7 +446,7 @@ func TestParseDefaultTags(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu_load",
+	exp := models.MustNewPoint("cpu_load",
 		models.Tags{"host": "localhost", "region": "us-east", "zone": "1c"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -484,7 +470,7 @@ func TestParseDefaultTemplateTags(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu_load",
+	exp := models.MustNewPoint("cpu_load",
 		models.Tags{"host": "localhost", "region": "us-east", "zone": "1c"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -508,7 +494,7 @@ func TestParseDefaultTemplateTagsOverridGlobal(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu_load",
+	exp := models.MustNewPoint("cpu_load",
 		models.Tags{"host": "localhost", "region": "us-east", "zone": "1c"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -532,7 +518,7 @@ func TestParseTemplateWhitespace(t *testing.T) {
 		t.Fatalf("unexpected error creating parser, got %v", err)
 	}
 
-	exp := models.NewPoint("cpu_load",
+	exp := models.MustNewPoint("cpu_load",
 		models.Tags{"host": "localhost", "region": "us-east", "zone": "1c"},
 		models.Fields{"value": float64(11)},
 		time.Unix(1435077219, 0))
@@ -544,5 +530,134 @@ func TestParseTemplateWhitespace(t *testing.T) {
 
 	if exp.String() != pt.String() {
 		t.Errorf("parse mismatch: got %v, exp %v", pt.String(), exp.String())
+	}
+}
+
+// Test basic functionality of ApplyTemplate
+func TestApplyTemplate(t *testing.T) {
+	o := graphite.Options{
+		Separator: "_",
+		Templates: []string{"current.* measurement.measurement"},
+	}
+	p, err := graphite.NewParserWithOptions(o)
+	if err != nil {
+		t.Fatalf("unexpected error creating parser, got %v", err)
+	}
+
+	measurement, _, _, _ := p.ApplyTemplate("current.users")
+	if measurement != "current_users" {
+		t.Errorf("Parser.ApplyTemplate unexpected result. got %s, exp %s",
+			measurement, "current_users")
+	}
+}
+
+// Test basic functionality of ApplyTemplate
+func TestApplyTemplateNoMatch(t *testing.T) {
+	o := graphite.Options{
+		Separator: "_",
+		Templates: []string{"foo.bar measurement.measurement"},
+	}
+	p, err := graphite.NewParserWithOptions(o)
+	if err != nil {
+		t.Fatalf("unexpected error creating parser, got %v", err)
+	}
+
+	measurement, _, _, _ := p.ApplyTemplate("current.users")
+	if measurement != "current.users" {
+		t.Errorf("Parser.ApplyTemplate unexpected result. got %s, exp %s",
+			measurement, "current.users")
+	}
+}
+
+// Test that most specific template is chosen
+func TestApplyTemplateSpecific(t *testing.T) {
+	o := graphite.Options{
+		Separator: "_",
+		Templates: []string{
+			"current.* measurement.measurement",
+			"current.*.* measurement.measurement.service",
+		},
+	}
+	p, err := graphite.NewParserWithOptions(o)
+	if err != nil {
+		t.Fatalf("unexpected error creating parser, got %v", err)
+	}
+
+	measurement, tags, _, _ := p.ApplyTemplate("current.users.facebook")
+	if measurement != "current_users" {
+		t.Errorf("Parser.ApplyTemplate unexpected result. got %s, exp %s",
+			measurement, "current_users")
+	}
+	service, ok := tags["service"]
+	if !ok {
+		t.Error("Expected for template to apply a 'service' tag, but not found")
+	}
+	if service != "facebook" {
+		t.Errorf("Expected service='facebook' tag, got service='%s'", service)
+	}
+}
+
+func TestApplyTemplateTags(t *testing.T) {
+	o := graphite.Options{
+		Separator: "_",
+		Templates: []string{"current.* measurement.measurement region=us-west"},
+	}
+	p, err := graphite.NewParserWithOptions(o)
+	if err != nil {
+		t.Fatalf("unexpected error creating parser, got %v", err)
+	}
+
+	measurement, tags, _, _ := p.ApplyTemplate("current.users")
+	if measurement != "current_users" {
+		t.Errorf("Parser.ApplyTemplate unexpected result. got %s, exp %s",
+			measurement, "current_users")
+	}
+
+	region, ok := tags["region"]
+	if !ok {
+		t.Error("Expected for template to apply a 'region' tag, but not found")
+	}
+	if region != "us-west" {
+		t.Errorf("Expected region='us-west' tag, got region='%s'", region)
+	}
+}
+
+func TestApplyTemplateField(t *testing.T) {
+	o := graphite.Options{
+		Separator: "_",
+		Templates: []string{"current.* measurement.measurement.field"},
+	}
+	p, err := graphite.NewParserWithOptions(o)
+	if err != nil {
+		t.Fatalf("unexpected error creating parser, got %v", err)
+	}
+
+	measurement, _, field, err := p.ApplyTemplate("current.users.logged_in")
+
+	if measurement != "current_users" {
+		t.Errorf("Parser.ApplyTemplate unexpected result. got %s, exp %s",
+			measurement, "current_users")
+	}
+
+	if field != "logged_in" {
+		t.Errorf("Parser.ApplyTemplate unexpected result. got %s, exp %s",
+			field, "logged_in")
+	}
+}
+
+func TestApplyTemplateFieldError(t *testing.T) {
+	o := graphite.Options{
+		Separator: "_",
+		Templates: []string{"current.* measurement.field.field"},
+	}
+	p, err := graphite.NewParserWithOptions(o)
+	if err != nil {
+		t.Fatalf("unexpected error creating parser, got %v", err)
+	}
+
+	_, _, _, err = p.ApplyTemplate("current.users.logged_in")
+	if err == nil {
+		t.Errorf("Parser.ApplyTemplate unexpected result. got %s, exp %s", err,
+			"'field' can only be used once in each template: current.users.logged_in")
 	}
 }

@@ -27,21 +27,21 @@ const leaderWaitTimeout = 30 * time.Second
 
 // statistics gathered by the openTSDB package.
 const (
-	statHTTPConnectionsHandled   = "http_connections_handled"
-	statTelnetConnectionsActive  = "tl_connections_active"
-	statTelnetConnectionsHandled = "tl_connections_handled"
-	statTelnetPointsReceived     = "tl_points_rx"
-	statTelnetBytesReceived      = "tl_bytes_rx"
-	statTelnetReadError          = "tl_read_err"
-	statTelnetBadLine            = "tl_bad_line"
-	statTelnetBadTime            = "tl_bad_time"
-	statTelnetBadTag             = "tl_bad_tag"
-	statTelnetBadFloat           = "tl_bad_float"
-	statBatchesTrasmitted        = "batches_tx"
-	statPointsTransmitted        = "points_tx"
-	statBatchesTransmitFail      = "batches_tx_fail"
-	statConnectionsActive        = "connections_active"
-	statConnectionsHandled       = "connections_handled"
+	statHTTPConnectionsHandled   = "httpConnsHandled"
+	statTelnetConnectionsActive  = "tlConnsActive"
+	statTelnetConnectionsHandled = "tlConnsHandled"
+	statTelnetPointsReceived     = "tlPointsRx"
+	statTelnetBytesReceived      = "tlBytesRx"
+	statTelnetReadError          = "tlReadErr"
+	statTelnetBadLine            = "tlBadLine"
+	statTelnetBadTime            = "tlBadTime"
+	statTelnetBadTag             = "tlBadTag"
+	statTelnetBadFloat           = "tlBadFloat"
+	statBatchesTrasmitted        = "batchesTx"
+	statPointsTransmitted        = "pointsTx"
+	statBatchesTransmitFail      = "batchesTxFail"
+	statConnectionsActive        = "connsActive"
+	statConnectionsHandled       = "connsHandled"
 )
 
 // Service manages the listener and handler for an HTTP endpoint.
@@ -49,6 +49,7 @@ type Service struct {
 	ln     net.Listener  // main listener
 	httpln *chanListener // http channel-based listener
 
+	mu   sync.Mutex
 	wg   sync.WaitGroup
 	done chan struct{}
 	err  chan error
@@ -104,6 +105,9 @@ func NewService(c Config) (*Service, error) {
 
 // Open starts the service
 func (s *Service) Open() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.Logger.Println("Starting OpenTSDB service")
 
 	// Configure expvar monitoring. It's OK to do this even if the service fails to open and
@@ -164,13 +168,18 @@ func (s *Service) Open() error {
 	return nil
 }
 
-// Close closes the underlying listener.
+// Close closes the openTSDB service
 func (s *Service) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.ln != nil {
 		return s.ln.Close()
 	}
 
-	s.batcher.Stop()
+	if s.batcher != nil {
+		s.batcher.Stop()
+	}
 	close(s.done)
 	s.wg.Wait()
 	return nil
@@ -318,14 +327,21 @@ func (s *Service) handleTelnetConn(conn net.Conn) {
 		}
 
 		fields := make(map[string]interface{})
-		fields["value"], err = strconv.ParseFloat(valueStr, 64)
+		fv, err := strconv.ParseFloat(valueStr, 64)
 		if err != nil {
 			s.statMap.Add(statTelnetBadFloat, 1)
 			s.Logger.Printf("bad float '%s' from %s", valueStr, remoteAddr)
 			continue
 		}
+		fields["value"] = fv
 
-		s.batcher.In() <- models.NewPoint(measurement, tags, fields, t)
+		pt, err := models.NewPoint(measurement, tags, fields, t)
+		if err != nil {
+			s.statMap.Add(statTelnetBadFloat, 1)
+			s.Logger.Printf("bad float '%s' from %s", valueStr, remoteAddr)
+			continue
+		}
+		s.batcher.In() <- pt
 	}
 }
 

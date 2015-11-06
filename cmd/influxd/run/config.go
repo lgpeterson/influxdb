@@ -22,26 +22,30 @@ import (
 	"github.com/influxdb/influxdb/services/httpd"
 	"github.com/influxdb/influxdb/services/opentsdb"
 	"github.com/influxdb/influxdb/services/precreator"
+	"github.com/influxdb/influxdb/services/registration"
 	"github.com/influxdb/influxdb/services/retention"
+	"github.com/influxdb/influxdb/services/subscriber"
 	"github.com/influxdb/influxdb/services/udp"
 	"github.com/influxdb/influxdb/tsdb"
 )
 
 // Config represents the configuration format for the influxd binary.
 type Config struct {
-	Meta       *meta.Config      `toml:"meta"`
-	Data       tsdb.Config       `toml:"data"`
-	Cluster    cluster.Config    `toml:"cluster"`
-	Retention  retention.Config  `toml:"retention"`
-	Precreator precreator.Config `toml:"shard-precreation"`
+	Meta         *meta.Config        `toml:"meta"`
+	Data         tsdb.Config         `toml:"data"`
+	Cluster      cluster.Config      `toml:"cluster"`
+	Retention    retention.Config    `toml:"retention"`
+	Registration registration.Config `toml:"registration"`
+	Precreator   precreator.Config   `toml:"shard-precreation"`
 
-	Admin     admin.Config      `toml:"admin"`
-	Monitor   monitor.Config    `toml:"monitor"`
-	HTTPD     httpd.Config      `toml:"http"`
-	Graphites []graphite.Config `toml:"graphite"`
-	Collectd  collectd.Config   `toml:"collectd"`
-	OpenTSDB  opentsdb.Config   `toml:"opentsdb"`
-	UDPs      []udp.Config      `toml:"udp"`
+	Admin      admin.Config      `toml:"admin"`
+	Monitor    monitor.Config    `toml:"monitor"`
+	Subscriber subscriber.Config `toml:"subscriber"`
+	HTTPD      httpd.Config      `toml:"http"`
+	Graphites  []graphite.Config `toml:"graphite"`
+	Collectd   collectd.Config   `toml:"collectd"`
+	OpenTSDB   opentsdb.Config   `toml:"opentsdb"`
+	UDPs       []udp.Config      `toml:"udp"`
 
 	// Snapshot SnapshotConfig `toml:"snapshot"`
 	ContinuousQuery continuous_querier.Config `toml:"continuous_queries"`
@@ -58,13 +62,17 @@ func NewConfig() *Config {
 	c.Meta = meta.NewConfig()
 	c.Data = tsdb.NewConfig()
 	c.Cluster = cluster.NewConfig()
+	c.Registration = registration.NewConfig()
 	c.Precreator = precreator.NewConfig()
 
 	c.Admin = admin.NewConfig()
 	c.Monitor = monitor.NewConfig()
+	c.Subscriber = subscriber.NewConfig()
 	c.HTTPD = httpd.NewConfig()
+	c.Graphites = []graphite.Config{graphite.NewConfig()}
 	c.Collectd = collectd.NewConfig()
 	c.OpenTSDB = opentsdb.NewConfig()
+	c.UDPs = []udp.Config{udp.NewConfig()}
 
 	c.ContinuousQuery = continuous_querier.NewConfig()
 	c.Retention = retention.NewConfig()
@@ -102,12 +110,12 @@ func NewDemoConfig() (*Config, error) {
 func (c *Config) Validate() error {
 	if c.Meta.Dir == "" {
 		return errors.New("Meta.Dir must be specified")
-	} else if c.Data.Dir == "" {
-		return errors.New("Data.Dir must be specified")
 	} else if c.HintedHandoff.Dir == "" {
 		return errors.New("HintedHandoff.Dir must be specified")
-	} else if c.Data.WALDir == "" {
-		return errors.New("Data.WALDir must be specified")
+	}
+
+	if err := c.Data.Validate(); err != nil {
+		return err
 	}
 
 	for _, g := range c.Graphites {
@@ -141,7 +149,7 @@ func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value) error {
 		configName := typeOfSpec.Field(i).Tag.Get("toml")
 		// Replace hyphens with underscores to avoid issues with shells
 		configName = strings.Replace(configName, "-", "_", -1)
-		fieldName := typeOfSpec.Field(i).Name
+		fieldKey := typeOfSpec.Field(i).Name
 
 		// Skip any fields that we cannot set
 		if f.CanSet() || f.Kind() == reflect.Slice {
@@ -188,14 +196,14 @@ func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value) error {
 				if f.Type().Name() == "Duration" {
 					dur, err := time.ParseDuration(value)
 					if err != nil {
-						return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldName, f.Type().String(), value)
+						return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldKey, f.Type().String(), value)
 					}
 					intValue = dur.Nanoseconds()
 				} else {
 					var err error
 					intValue, err = strconv.ParseInt(value, 0, f.Type().Bits())
 					if err != nil {
-						return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldName, f.Type().String(), value)
+						return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldKey, f.Type().String(), value)
 					}
 				}
 
@@ -203,14 +211,14 @@ func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value) error {
 			case reflect.Bool:
 				boolValue, err := strconv.ParseBool(value)
 				if err != nil {
-					return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldName, f.Type().String(), value)
+					return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldKey, f.Type().String(), value)
 
 				}
 				f.SetBool(boolValue)
 			case reflect.Float32, reflect.Float64:
 				floatValue, err := strconv.ParseFloat(value, f.Type().Bits())
 				if err != nil {
-					return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldName, f.Type().String(), value)
+					return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldKey, f.Type().String(), value)
 
 				}
 				f.SetFloat(floatValue)

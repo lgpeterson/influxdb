@@ -11,43 +11,73 @@ import (
 )
 
 var (
-	batchSize     = flag.Int("batchsize", 5000, "number of points per batch")
-	seriesCount   = flag.Int("series", 100000, "number of unique series to create")
-	pointCount    = flag.Int("points", 100, "number of points per series to create")
-	concurrency   = flag.Int("concurrency", 10, "number of simultaneous writes to run")
+	batchSize     = flag.Int("batchsize", 0, "number of points per batch")
+	concurrency   = flag.Int("concurrency", 0, "number of simultaneous writes to run")
 	batchInterval = flag.Duration("batchinterval", 0*time.Second, "duration between batches")
-	database      = flag.String("database", "stress", "name of database")
-	address       = flag.String("addr", "localhost:8086", "IP address and port of database (e.g., localhost:8086)")
-	precision     = flag.String("precision", "n", "The precision that points in the database will be with")
+	database      = flag.String("database", "", "name of database")
+	address       = flag.String("addr", "", "IP address and port of database (e.g., localhost:8086)")
+	precision     = flag.String("precision", "", "The precision that points in the database will be with")
+	test          = flag.String("test", "", "The stress test file")
 )
 
-var ms runner.Measurements
-
-func init() {
-	flag.Var(&ms, "m", "comma-separated list of intervals to use between events")
-}
-
 func main() {
-	flag.Parse()
+	var cfg *runner.Config
+	var err error
+
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	flag.Parse()
 
-	if len(ms) == 0 {
-		ms = append(ms, "cpu")
+	if *test == "" {
+		fmt.Println("'-test' flag is required")
+		return
 	}
 
-	cfg := &runner.Config{
-		BatchSize:     *batchSize,
-		Measurements:  ms,
-		SeriesCount:   *seriesCount,
-		PointCount:    *pointCount,
-		Concurrency:   *concurrency,
-		BatchInterval: *batchInterval,
-		Database:      *database,
-		Address:       *address,
-		Precision:     *precision,
+	cfg, err = runner.DecodeFile(*test)
+	if err != nil {
+		fmt.Println(err)
+		return
 	}
 
-	totalPoints, failedRequests, responseTimes, timer := runner.Run(cfg)
+	if *batchSize != 0 {
+		cfg.Write.BatchSize = *batchSize
+	}
+
+	if *concurrency != 0 {
+		cfg.Write.Concurrency = *concurrency
+	}
+
+	if *batchInterval != 0*time.Second {
+		cfg.Write.BatchInterval = batchInterval.String()
+	}
+
+	if *database != "" {
+		cfg.Write.Database = *database
+	}
+
+	if *address != "" {
+		cfg.Write.Address = *address
+	}
+
+	if *precision != "" {
+		cfg.Write.Precision = *precision
+	}
+
+	d := make(chan struct{})
+	seriesQueryResults := make(chan runner.QueryResults)
+
+	if cfg.SeriesQuery.Enabled {
+		go runner.SeriesQuery(cfg, d, seriesQueryResults)
+	}
+
+	measurementQueryResults := make(chan runner.QueryResults)
+
+	ts := make(chan time.Time)
+	if cfg.MeasurementQuery.Enabled {
+		go runner.MeasurementQuery(cfg, ts, measurementQueryResults)
+	}
+
+	// Get the stress results
+	totalPoints, failedRequests, responseTimes, timer := runner.Run(cfg, d, ts)
 
 	sort.Sort(sort.Reverse(sort.Interface(responseTimes)))
 
@@ -64,4 +94,35 @@ func main() {
 	for _, r := range responseTimes[:100] {
 		fmt.Println(time.Duration(r.Value))
 	}
+
+	// Get series query results
+	if cfg.SeriesQuery.Enabled {
+		qrs := <-seriesQueryResults
+
+		queryTotal := int64(0)
+		for _, qt := range qrs.ResponseTimes {
+			queryTotal += int64(qt.Value)
+		}
+		seriesQueryMean := queryTotal / int64(len(qrs.ResponseTimes))
+
+		fmt.Printf("Queried Series %d times with a average response time of %v milliseconds\n", qrs.TotalQueries, time.Duration(seriesQueryMean).Seconds()*1000)
+
+	}
+
+	// Get measurement query results
+	if cfg.MeasurementQuery.Enabled {
+		qrs := <-measurementQueryResults
+
+		queryTotal := int64(0)
+		for _, qt := range qrs.ResponseTimes {
+			queryTotal += int64(qt.Value)
+		}
+		seriesQueryMean := queryTotal / int64(len(qrs.ResponseTimes))
+
+		fmt.Printf("Queried Measurement %d times with a average response time of %v milliseconds\n", qrs.TotalQueries, time.Duration(seriesQueryMean).Seconds()*1000)
+
+	}
+
+	return
+
 }

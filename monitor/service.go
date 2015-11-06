@@ -64,9 +64,10 @@ func (d *Diagnostic) AddRow(r []interface{}) {
 // Monitor represents an instance of the monitor system.
 type Monitor struct {
 	// Build information for diagnostics.
-	Version string
-	Commit  string
-	Branch  string
+	Version   string
+	Commit    string
+	Branch    string
+	BuildTime string
 
 	wg   sync.WaitGroup
 	done chan struct{}
@@ -74,6 +75,7 @@ type Monitor struct {
 
 	diagRegistrations map[string]DiagsClient
 
+	storeCreated           bool
 	storeEnabled           bool
 	storeDatabase          string
 	storeRetentionPolicy   string
@@ -86,6 +88,7 @@ type Monitor struct {
 		ClusterID() (uint64, error)
 		NodeID() uint64
 		WaitForLeader(d time.Duration) error
+		IsLeader() bool
 		CreateDatabaseIfNotExists(name string) (*meta.DatabaseInfo, error)
 		CreateRetentionPolicyIfNotExists(database string, rpi *meta.RetentionPolicyInfo) (*meta.RetentionPolicyInfo, error)
 		SetDefaultRetentionPolicy(database, name string) error
@@ -112,7 +115,7 @@ func New(c Config) *Monitor {
 }
 
 // Open opens the monitoring system, using the given clusterID, node ID, and hostname
-// for identification purposem.
+// for identification purpose.
 func (m *Monitor) Open() error {
 	m.Logger.Printf("Starting monitor system")
 
@@ -121,6 +124,7 @@ func (m *Monitor) Open() error {
 		Version: m.Version,
 		Commit:  m.Commit,
 		Branch:  m.Branch,
+		Time:    m.BuildTime,
 	})
 	m.RegisterDiagnosticsClient("runtime", &goRuntime{})
 	m.RegisterDiagnosticsClient("network", &network{})
@@ -151,18 +155,24 @@ func (m *Monitor) SetLogger(l *log.Logger) {
 }
 
 // RegisterDiagnosticsClient registers a diagnostics client with the given name and tags.
-func (m *Monitor) RegisterDiagnosticsClient(name string, client DiagsClient) error {
+func (m *Monitor) RegisterDiagnosticsClient(name string, client DiagsClient) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.diagRegistrations[name] = client
 	m.Logger.Printf(`'%s' registered for diagnostics monitoring`, name)
-	return nil
+}
+
+// DeregisterDiagnosticsClient deregisters a diagnostics client by name.
+func (m *Monitor) DeregisterDiagnosticsClient(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.diagRegistrations, name)
 }
 
 // Statistics returns the combined statistics for all expvar data. The given
 // tags are added to each of the returned statistics.
-func (m *Monitor) Statistics(tags map[string]string) ([]*statistic, error) {
-	statistics := make([]*statistic, 0)
+func (m *Monitor) Statistics(tags map[string]string) ([]*Statistic, error) {
+	statistics := make([]*Statistic, 0)
 
 	expvar.Do(func(kv expvar.KeyValue) {
 		// Skip built-in expvar stats.
@@ -170,7 +180,7 @@ func (m *Monitor) Statistics(tags map[string]string) ([]*statistic, error) {
 			return
 		}
 
-		statistic := &statistic{
+		statistic := &Statistic{
 			Tags:   make(map[string]string),
 			Values: make(map[string]interface{}),
 		}
@@ -236,7 +246,7 @@ func (m *Monitor) Statistics(tags map[string]string) ([]*statistic, error) {
 	})
 
 	// Add Go memstats.
-	statistic := &statistic{
+	statistic := &Statistic{
 		Name:   "runtime",
 		Tags:   make(map[string]string),
 		Values: make(map[string]interface{}),
@@ -286,6 +296,42 @@ func (m *Monitor) Diagnostics() (map[string]*Diagnostic, error) {
 	return diags, nil
 }
 
+// createInternalStorage ensures the internal storage has been created.
+func (m *Monitor) createInternalStorage() {
+	if !m.MetaStore.IsLeader() || m.storeCreated {
+		return
+	}
+
+	if _, err := m.MetaStore.CreateDatabaseIfNotExists(m.storeDatabase); err != nil {
+		m.Logger.Printf("failed to create database '%s', failed to create storage: %s",
+			m.storeDatabase, err.Error())
+		return
+	}
+
+	rpi := meta.NewRetentionPolicyInfo(MonitorRetentionPolicy)
+	rpi.Duration = MonitorRetentionPolicyDuration
+	rpi.ReplicaN = 1
+	if _, err := m.MetaStore.CreateRetentionPolicyIfNotExists(m.storeDatabase, rpi); err != nil {
+		m.Logger.Printf("failed to create retention policy '%s', failed to create internal storage: %s",
+			rpi.Name, err.Error())
+		return
+	}
+
+	if err := m.MetaStore.SetDefaultRetentionPolicy(m.storeDatabase, rpi.Name); err != nil {
+		m.Logger.Printf("failed to set default retention policy on '%s', failed to create internal storage: %s",
+			m.storeDatabase, err.Error())
+		return
+	}
+
+	if err := m.MetaStore.DropRetentionPolicy(m.storeDatabase, "default"); err != nil && err != meta.ErrRetentionPolicyNotFound {
+		m.Logger.Printf("failed to delete retention policy 'default', failed to created internal storage: %s", err.Error())
+		return
+	}
+
+	// Mark storage creation complete.
+	m.storeCreated = true
+}
+
 // storeStatistics writes the statistics to an InfluxDB system.
 func (m *Monitor) storeStatistics() {
 	defer m.wg.Done()
@@ -307,37 +353,13 @@ func (m *Monitor) storeStatistics() {
 		"hostname":  hostname,
 	}
 
-	if _, err := m.MetaStore.CreateDatabaseIfNotExists(m.storeDatabase); err != nil {
-		m.Logger.Printf("failed to create database '%s', terminating storage: %s",
-			m.storeDatabase, err.Error())
-		return
-	}
-
-	rpi := meta.NewRetentionPolicyInfo(MonitorRetentionPolicy)
-	rpi.Duration = MonitorRetentionPolicyDuration
-	rpi.ReplicaN = 1
-	if _, err := m.MetaStore.CreateRetentionPolicyIfNotExists(m.storeDatabase, rpi); err != nil {
-		m.Logger.Printf("failed to create retention policy '%s', terminating storage: %s",
-			rpi.Name, err.Error())
-		return
-	}
-
-	if err := m.MetaStore.SetDefaultRetentionPolicy(m.storeDatabase, rpi.Name); err != nil {
-		m.Logger.Printf("failed to set default retention policy on '%s', terminating storage: %s",
-			m.storeDatabase, err.Error())
-		return
-	}
-
-	if err := m.MetaStore.DropRetentionPolicy(m.storeDatabase, "default"); err != nil && err != meta.ErrRetentionPolicyNotFound {
-		m.Logger.Printf("failed to delete retention policy 'default', terminating storage: %s", err.Error())
-		return
-	}
-
 	tick := time.NewTicker(m.storeInterval)
 	defer tick.Stop()
 	for {
 		select {
 		case <-tick.C:
+			m.createInternalStorage()
+
 			stats, err := m.Statistics(clusterTags)
 			if err != nil {
 				m.Logger.Printf("failed to retrieve registered statistics: %s", err)
@@ -346,7 +368,12 @@ func (m *Monitor) storeStatistics() {
 
 			points := make(models.Points, 0, len(stats))
 			for _, s := range stats {
-				points = append(points, models.NewPoint(s.Name, s.Tags, s.Values, time.Now()))
+				pt, err := models.NewPoint(s.Name, s.Tags, s.Values, time.Now().Truncate(time.Second))
+				if err != nil {
+					m.Logger.Printf("Dropping point %v: %v", s.Name, err)
+					continue
+				}
+				points = append(points, pt)
 			}
 
 			err = m.PointsWriter.WritePoints(&cluster.WritePointsRequest{
@@ -366,16 +393,16 @@ func (m *Monitor) storeStatistics() {
 	}
 }
 
-// statistic represents the information returned by a single monitor client.
-type statistic struct {
-	Name   string
-	Tags   map[string]string
-	Values map[string]interface{}
+// Statistic represents the information returned by a single monitor client.
+type Statistic struct {
+	Name   string                 `json:"name"`
+	Tags   map[string]string      `json:"tags"`
+	Values map[string]interface{} `json:"values"`
 }
 
 // newStatistic returns a new statistic object.
-func newStatistic(name string, tags map[string]string, values map[string]interface{}) *statistic {
-	return &statistic{
+func newStatistic(name string, tags map[string]string, values map[string]interface{}) *Statistic {
+	return &Statistic{
 		Name:   name,
 		Tags:   tags,
 		Values: values,
@@ -383,7 +410,7 @@ func newStatistic(name string, tags map[string]string, values map[string]interfa
 }
 
 // valueNames returns a sorted list of the value names, if any.
-func (s *statistic) valueNames() []string {
+func (s *Statistic) valueNames() []string {
 	a := make([]string, 0, len(s.Values))
 	for k, _ := range s.Values {
 		a = append(a, k)

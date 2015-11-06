@@ -1,6 +1,10 @@
 package tsdb
 
 import (
+	"errors"
+	"fmt"
+	"log"
+	"os"
 	"time"
 
 	"github.com/influxdb/influxdb/toml"
@@ -42,7 +46,15 @@ const (
 	// we'll need to create backpressure, otherwise we'll fill up the memory and die.
 	// This number multiplied by the parition count is roughly the max possible memory
 	// size for the in-memory WAL cache.
-	DefaultPartitionSizeThreshold = 20 * 1024 * 1024 // 20MB
+	DefaultPartitionSizeThreshold = 50 * 1024 * 1024 // 50MB
+
+	// Default WAL settings for the TSM1 WAL
+	DefaultFlushMemorySizeThreshold    = 5 * 1024 * 1024   // 5MB
+	DefaultMaxMemorySizeThreshold      = 100 * 1024 * 1024 // 100MB
+	DefaultIndexCompactionAge          = time.Minute
+	DefaultIndexMinCompactionInterval  = time.Minute
+	DefaultIndexMinCompactionFileCount = 5
+	DefaultIndexCompactionFullAge      = 5 * time.Minute
 )
 
 type Config struct {
@@ -63,24 +75,79 @@ type Config struct {
 	WALFlushColdInterval      toml.Duration `toml:"wal-flush-cold-interval"`
 	WALPartitionSizeThreshold uint64        `toml:"wal-partition-size-threshold"`
 
+	// WAL configuration options for tsm1 introduced in 0.9.5
+	WALFlushMemorySizeThreshold int `toml:"wal-flush-memory-size-threshold"`
+	WALMaxMemorySizeThreshold   int `toml:"wal-max-memory-size-threshold"`
+
+	// compaction options for tsm1 introduced in 0.9.5
+
+	// IndexCompactionAge specifies the duration after the data file creation time
+	// at which it is eligible to be compacted
+	IndexCompactionAge time.Duration `toml:"index-compaction-age"`
+
+	// IndexMinimumCompactionInterval specifies the minimum amount of time that must
+	// pass after a compaction before another compaction is run
+	IndexMinCompactionInterval time.Duration `toml:"index-min-compaction-interval"`
+
+	// IndexCompactionFileCount specifies the minimum number of data files that
+	// must be eligible for compaction before actually running one
+	IndexMinCompactionFileCount int `toml:"index-compaction-min-file-count"`
+
+	// IndexCompactionFullAge specifies how long after the last write was received
+	// in the WAL that a full compaction should be performed.
+	IndexCompactionFullAge time.Duration `toml:"index-compaction-full-age"`
+
 	// Query logging
 	QueryLogEnabled bool `toml:"query-log-enabled"`
 }
 
 func NewConfig() Config {
+	defaultEngine := DefaultEngine
+	if engine := os.Getenv("INFLUXDB_DATA_ENGINE"); engine != "" {
+		log.Println("TSDB engine selected via environment variable:", engine)
+		defaultEngine = engine
+	}
+
 	return Config{
-		Engine:                 DefaultEngine,
+		Engine:                 defaultEngine,
 		MaxWALSize:             DefaultMaxWALSize,
 		WALFlushInterval:       toml.Duration(DefaultWALFlushInterval),
 		WALPartitionFlushDelay: toml.Duration(DefaultWALPartitionFlushDelay),
 
-		WALLoggingEnabled:         true,
-		WALReadySeriesSize:        DefaultReadySeriesSize,
-		WALCompactionThreshold:    DefaultCompactionThreshold,
-		WALMaxSeriesSize:          DefaultMaxSeriesSize,
-		WALFlushColdInterval:      toml.Duration(DefaultFlushColdInterval),
-		WALPartitionSizeThreshold: DefaultPartitionSizeThreshold,
+		WALLoggingEnabled:           true,
+		WALReadySeriesSize:          DefaultReadySeriesSize,
+		WALCompactionThreshold:      DefaultCompactionThreshold,
+		WALMaxSeriesSize:            DefaultMaxSeriesSize,
+		WALFlushColdInterval:        toml.Duration(DefaultFlushColdInterval),
+		WALPartitionSizeThreshold:   DefaultPartitionSizeThreshold,
+		WALFlushMemorySizeThreshold: DefaultFlushMemorySizeThreshold,
+		WALMaxMemorySizeThreshold:   DefaultMaxMemorySizeThreshold,
+		IndexCompactionAge:          DefaultIndexCompactionAge,
+		IndexMinCompactionFileCount: DefaultIndexMinCompactionFileCount,
+		IndexCompactionFullAge:      DefaultIndexCompactionFullAge,
+		IndexMinCompactionInterval:  DefaultIndexMinCompactionInterval,
 
 		QueryLogEnabled: true,
 	}
+}
+
+func (c *Config) Validate() error {
+	if c.Dir == "" {
+		return errors.New("Data.Dir must be specified")
+	} else if c.WALDir == "" {
+		return errors.New("Data.WALDir must be specified")
+	}
+
+	valid := false
+	for _, e := range RegisteredEngines() {
+		if e == c.Engine {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return fmt.Errorf("unrecognized engine %s", c.Engine)
+	}
+
+	return nil
 }

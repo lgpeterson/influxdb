@@ -39,6 +39,10 @@ const (
 	defaultPPS = 0
 )
 
+const (
+	noTokenMsg = "Visit https://enterprise.influxdata.com to register for updates, InfluxDB server management, and monitoring.\n"
+)
+
 type CommandLine struct {
 	Client           *client.Client
 	Line             *liner.State
@@ -158,9 +162,21 @@ Examples:
 	}
 
 	if err := c.connect(""); err != nil {
-
+		fmt.Fprintf(os.Stderr,
+			"Failed to connect to %s\nPlease check your connection settings and ensure 'influxd' is running.\n",
+			c.Client.Addr())
+		return
 	}
+
 	if c.Execute == "" && !c.Import {
+		token, err := c.DatabaseToken()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to check token: %s\n", err.Error())
+			return
+		}
+		if token == "" {
+			fmt.Printf(noTokenMsg)
+		}
 		fmt.Printf("Connected to %s version %s\n", c.Client.Addr(), c.Version)
 	}
 
@@ -526,6 +542,24 @@ func (c *CommandLine) ExecuteQuery(query string) error {
 		return err
 	}
 	return nil
+}
+
+func (c *CommandLine) DatabaseToken() (string, error) {
+	response, err := c.Client.Query(client.Query{Command: "SHOW DIAGNOSTICS for 'registration'"})
+	if err != nil {
+		return "", err
+	}
+	if response.Error() != nil || len((*response).Results[0].Series) == 0 {
+		return "", nil
+	}
+
+	// Look for position of "token" column.
+	for i, s := range (*response).Results[0].Series[0].Columns {
+		if s == "token" {
+			return (*response).Results[0].Series[0].Values[0][i].(string), nil
+		}
+	}
+	return "", nil
 }
 
 func (c *CommandLine) FormatResponse(response *client.Response, w io.Writer) {

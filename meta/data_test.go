@@ -26,7 +26,7 @@ func TestData_CreateNode(t *testing.T) {
 }
 
 // Ensure a node can be removed.
-func TestData_DeleteNode(t *testing.T) {
+func TestData_DeleteNode_Basic(t *testing.T) {
 	var data meta.Data
 	if err := data.CreateNode("host0"); err != nil {
 		t.Fatal(err)
@@ -36,7 +36,7 @@ func TestData_DeleteNode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := data.DeleteNode(1); err != nil {
+	if err := data.DeleteNode(1, false); err != nil {
 		t.Fatal(err)
 	} else if len(data.Nodes) != 2 {
 		t.Fatalf("unexpected node count: %d", len(data.Nodes))
@@ -44,6 +44,49 @@ func TestData_DeleteNode(t *testing.T) {
 		t.Fatalf("unexpected node: %#v", data.Nodes[0])
 	} else if data.Nodes[1] != (meta.NodeInfo{ID: 3, Host: "host2"}) {
 		t.Fatalf("unexpected node: %#v", data.Nodes[1])
+	}
+}
+
+// Ensure a node can be removed with shard info in play
+func TestData_DeleteNode_Shards(t *testing.T) {
+	var data meta.Data
+	if err := data.CreateNode("host0"); err != nil {
+		t.Fatal(err)
+	} else if err = data.CreateNode("host1"); err != nil {
+		t.Fatal(err)
+	} else if err := data.CreateNode("host2"); err != nil {
+		t.Fatal(err)
+	} else if err := data.CreateNode("host3"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := data.CreateDatabase("mydb"); err != nil {
+		t.Fatal(err)
+	}
+
+	rpi := &meta.RetentionPolicyInfo{
+		Name:     "myrp",
+		ReplicaN: 3,
+	}
+	if err := data.CreateRetentionPolicy("mydb", rpi); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.CreateShardGroup("mydb", "myrp", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Databases[0].RetentionPolicies[0].ShardGroups[0].Shards[0].Owners) != 3 {
+		t.Fatal("wrong number of shard owners")
+	}
+	if err := data.DeleteNode(2, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, exp := len(data.Databases[0].RetentionPolicies[0].ShardGroups[0].Shards[0].Owners), 2; exp != got {
+		t.Fatalf("wrong number of shard owners, got %d, exp %d", got, exp)
+	}
+	for _, s := range data.Databases[0].RetentionPolicies[0].ShardGroups[0].Shards {
+		if s.OwnedBy(2) {
+			t.Fatal("shard still owned by delted node")
+		}
 	}
 }
 
@@ -467,6 +510,52 @@ func TestData_DropContinuousQuery(t *testing.T) {
 		{Name: "cq1", Query: "SELECT count() FROM bar"},
 	}) {
 		t.Fatalf("unexpected queries: %#v", data.Databases[0].ContinuousQueries)
+	}
+}
+
+// Ensure a subscription can be created.
+func TestData_CreateSubscription(t *testing.T) {
+	var data meta.Data
+	rpi := &meta.RetentionPolicyInfo{
+		Name:     "rp0",
+		ReplicaN: 3,
+	}
+	if err := data.CreateDatabase("db0"); err != nil {
+		t.Fatal(err)
+	} else if err := data.CreateRetentionPolicy("db0", rpi); err != nil {
+		t.Fatal(err)
+	} else if err := data.CreateSubscription("db0", "rp0", "s0", "ANY", []string{"udp://h0:1234", "udp://h1:1234"}); err != nil {
+		t.Fatal(err)
+	} else if !reflect.DeepEqual(data.Databases[0].RetentionPolicies[0].Subscriptions, []meta.SubscriptionInfo{
+		{Name: "s0", Mode: "ANY", Destinations: []string{"udp://h0:1234", "udp://h1:1234"}},
+	}) {
+		t.Fatalf("unexpected subscriptions: %#v", data.Databases[0].RetentionPolicies[0].Subscriptions)
+	}
+}
+
+// Ensure a subscription can be removed.
+func TestData_DropSubscription(t *testing.T) {
+	var data meta.Data
+	rpi := &meta.RetentionPolicyInfo{
+		Name:     "rp0",
+		ReplicaN: 3,
+	}
+	if err := data.CreateDatabase("db0"); err != nil {
+		t.Fatal(err)
+	} else if err := data.CreateRetentionPolicy("db0", rpi); err != nil {
+		t.Fatal(err)
+	} else if err := data.CreateSubscription("db0", "rp0", "s0", "ANY", []string{"udp://h0:1234", "udp://h1:1234"}); err != nil {
+		t.Fatal(err)
+	} else if err := data.CreateSubscription("db0", "rp0", "s1", "ALL", []string{"udp://h0:1234", "udp://h1:1234"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := data.DropSubscription("db0", "rp0", "s0"); err != nil {
+		t.Fatal(err)
+	} else if !reflect.DeepEqual(data.Databases[0].RetentionPolicies[0].Subscriptions, []meta.SubscriptionInfo{
+		{Name: "s1", Mode: "ALL", Destinations: []string{"udp://h0:1234", "udp://h1:1234"}},
+	}) {
+		t.Fatalf("unexpected subscriptions: %#v", data.Databases[0].RetentionPolicies[0].Subscriptions)
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"expvar"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"os"
 	"strings"
@@ -24,65 +23,31 @@ const (
 	leaderWaitTimeout = 30 * time.Second
 )
 
-// Initialize the graphite stats and diags
-func init() {
-	tcpConnections = make(map[string]*tcpConnectionDiag)
-}
+// statistics gathered by the graphite package.
+const (
+	statPointsReceived      = "pointsRx"
+	statBytesReceived       = "bytesRx"
+	statPointsParseFail     = "pointsParseFail"
+	statPointsUnsupported   = "pointsUnsupportedFail"
+	statBatchesTrasmitted   = "batchesTx"
+	statPointsTransmitted   = "pointsTx"
+	statBatchesTransmitFail = "batchesTxFail"
+	statConnectionsActive   = "connsActive"
+	statConnectionsHandled  = "connsHandled"
+)
 
-// Package-level tracking of connections for diagnostics.
-var monitorOnce sync.Once
-
-type tcpConnectionDiag struct {
+type tcpConnection struct {
 	conn        net.Conn
 	connectTime time.Time
 }
 
-var tcpConnectionsMu sync.Mutex
-var tcpConnections map[string]*tcpConnectionDiag
-
-func addConnection(c net.Conn) {
-	tcpConnectionsMu.Lock()
-	defer tcpConnectionsMu.Unlock()
-	tcpConnections[c.RemoteAddr().String()] = &tcpConnectionDiag{
-		conn:        c,
-		connectTime: time.Now().UTC(),
-	}
+func (c *tcpConnection) Close() {
+	c.conn.Close()
 }
-func removeConnection(c net.Conn) {
-	tcpConnectionsMu.Lock()
-	defer tcpConnectionsMu.Unlock()
-	delete(tcpConnections, c.RemoteAddr().String())
-}
-
-func handleDiagnostics() (*monitor.Diagnostic, error) {
-	tcpConnectionsMu.Lock()
-	defer tcpConnectionsMu.Unlock()
-
-	d := &monitor.Diagnostic{
-		Columns: []string{"local", "remote", "connect time"},
-		Rows:    make([][]interface{}, 0, len(tcpConnections)),
-	}
-	for _, v := range tcpConnections {
-		_ = v
-		d.Rows = append(d.Rows, []interface{}{v.conn.LocalAddr().String(), v.conn.RemoteAddr().String(), v.connectTime})
-	}
-	return d, nil
-}
-
-// statistics gathered by the graphite package.
-const (
-	statPointsReceived      = "points_rx"
-	statBytesReceived       = "bytes_rx"
-	statPointsParseFail     = "points_parse_fail"
-	statPointsUnsupported   = "points_unsupported_fail"
-	statBatchesTrasmitted   = "batches_tx"
-	statPointsTransmitted   = "points_tx"
-	statBatchesTransmitFail = "batches_tx_fail"
-	statConnectionsActive   = "connections_active"
-	statConnectionsHandled  = "connections_handled"
-)
 
 type Service struct {
+	mu sync.Mutex
+
 	bindAddress      string
 	database         string
 	protocol         string
@@ -94,8 +59,10 @@ type Service struct {
 	batcher *tsdb.PointBatcher
 	parser  *Parser
 
-	logger  *log.Logger
-	statMap *expvar.Map
+	logger           *log.Logger
+	statMap          *expvar.Map
+	tcpConnectionsMu sync.Mutex
+	tcpConnections   map[string]*tcpConnection
 
 	ln      net.Listener
 	addr    net.Addr
@@ -105,7 +72,8 @@ type Service struct {
 	done chan struct{}
 
 	Monitor interface {
-		RegisterDiagnosticsClient(name string, client monitor.DiagsClient) error
+		RegisterDiagnosticsClient(name string, client monitor.DiagsClient)
+		DeregisterDiagnosticsClient(name string)
 	}
 	PointsWriter interface {
 		WritePoints(p *cluster.WritePointsRequest) error
@@ -122,14 +90,15 @@ func NewService(c Config) (*Service, error) {
 	d := c.WithDefaults()
 
 	s := Service{
-		bindAddress:  d.BindAddress,
-		database:     d.Database,
-		protocol:     d.Protocol,
-		batchSize:    d.BatchSize,
-		batchPending: d.BatchPending,
-		batchTimeout: time.Duration(d.BatchTimeout),
-		logger:       log.New(os.Stderr, "[graphite] ", log.LstdFlags),
-		done:         make(chan struct{}),
+		bindAddress:    d.BindAddress,
+		database:       d.Database,
+		protocol:       d.Protocol,
+		batchSize:      d.BatchSize,
+		batchPending:   d.BatchPending,
+		batchTimeout:   time.Duration(d.BatchTimeout),
+		logger:         log.New(os.Stderr, "[graphite] ", log.LstdFlags),
+		tcpConnections: make(map[string]*tcpConnection),
+		done:           make(chan struct{}),
 	}
 
 	consistencyLevel, err := cluster.ParseConsistencyLevel(d.ConsistencyLevel)
@@ -153,6 +122,9 @@ func NewService(c Config) (*Service, error) {
 
 // Open starts the Graphite input processing data.
 func (s *Service) Open() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.logger.Printf("Starting graphite service, batch size %d, batch timeout %s", s.batchSize, s.batchTimeout)
 
 	// Configure expvar monitoring. It's OK to do this even if the service fails to open and
@@ -161,14 +133,10 @@ func (s *Service) Open() error {
 	tags := map[string]string{"proto": s.protocol, "bind": s.bindAddress}
 	s.statMap = influxdb.NewStatistics(key, "graphite", tags)
 
-	// One Graphite service hooks up diagnostics for all Graphite functionality.
-	monitorOnce.Do(func() {
-		if s.Monitor == nil {
-			s.logger.Println("no monitor service available, no monitoring will be performed")
-			return
-		}
-		s.Monitor.RegisterDiagnosticsClient("graphite", monitor.DiagsClientFunc(handleDiagnostics))
-	})
+	// Register diagnostics if a Monitor service is available.
+	if s.Monitor != nil {
+		s.Monitor.RegisterDiagnosticsClient(key, s)
+	}
 
 	if err := s.MetaStore.WaitForLeader(leaderWaitTimeout); err != nil {
 		s.logger.Printf("Failed to detect a cluster leader: %s", err.Error())
@@ -202,9 +170,21 @@ func (s *Service) Open() error {
 	s.logger.Printf("Listening on %s: %s", strings.ToUpper(s.protocol), s.addr.String())
 	return nil
 }
+func (s *Service) closeAllConnections() {
+	s.tcpConnectionsMu.Lock()
+	defer s.tcpConnectionsMu.Unlock()
+	for _, c := range s.tcpConnections {
+		c.Close()
+	}
+}
 
 // Close stops all data processing on the Graphite input.
 func (s *Service) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.closeAllConnections()
+
 	if s.ln != nil {
 		s.ln.Close()
 	}
@@ -212,7 +192,9 @@ func (s *Service) Close() error {
 		s.udpConn.Close()
 	}
 
-	s.batcher.Stop()
+	if s.batcher != nil {
+		s.batcher.Stop()
+	}
 	close(s.done)
 	s.wg.Wait()
 	s.done = nil
@@ -262,11 +244,11 @@ func (s *Service) openTCPServer() (net.Addr, error) {
 func (s *Service) handleTCPConnection(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
-	defer removeConnection(conn)
 	defer s.statMap.Add(statConnectionsActive, -1)
-	addConnection(conn)
+	defer s.untrackConnection(conn)
 	s.statMap.Add(statConnectionsActive, 1)
 	s.statMap.Add(statConnectionsHandled, 1)
+	s.trackConnection(conn)
 
 	reader := bufio.NewReader(conn)
 
@@ -284,6 +266,20 @@ func (s *Service) handleTCPConnection(conn net.Conn) {
 		s.statMap.Add(statBytesReceived, int64(len(buf)))
 		s.handleLine(line)
 	}
+}
+
+func (s *Service) trackConnection(c net.Conn) {
+	s.tcpConnectionsMu.Lock()
+	defer s.tcpConnectionsMu.Unlock()
+	s.tcpConnections[c.RemoteAddr().String()] = &tcpConnection{
+		conn:        c,
+		connectTime: time.Now().UTC(),
+	}
+}
+func (s *Service) untrackConnection(c net.Conn) {
+	s.tcpConnectionsMu.Lock()
+	defer s.tcpConnectionsMu.Unlock()
+	delete(s.tcpConnections, c.RemoteAddr().String())
 }
 
 // openUDPServer opens the Graphite input in UDP mode and starts processing incoming data.
@@ -328,19 +324,9 @@ func (s *Service) handleLine(line string) {
 	// Parse it.
 	point, err := s.parser.Parse(line)
 	if err != nil {
-		s.logger.Printf("unable to parse line: %s", err)
+		s.logger.Printf("unable to parse line: %s: %s", line, err)
 		s.statMap.Add(statPointsParseFail, 1)
 		return
-	}
-
-	f, ok := point.Fields()["value"].(float64)
-	if ok {
-		// Drop NaN and +/-Inf data points since they are not supported values
-		if math.IsNaN(f) || math.IsInf(f, 0) {
-			s.logger.Printf("dropping unsupported value: '%v'", line)
-			s.statMap.Add(statPointsUnsupported, 1)
-			return
-		}
 	}
 
 	s.batcher.In() <- point
@@ -369,4 +355,19 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 			return
 		}
 	}
+}
+
+func (s *Service) Diagnostics() (*monitor.Diagnostic, error) {
+	s.tcpConnectionsMu.Lock()
+	defer s.tcpConnectionsMu.Unlock()
+
+	d := &monitor.Diagnostic{
+		Columns: []string{"local", "remote", "connect time"},
+		Rows:    make([][]interface{}, 0, len(s.tcpConnections)),
+	}
+	for _, v := range s.tcpConnections {
+		_ = v
+		d.Rows = append(d.Rows, []interface{}{v.conn.LocalAddr().String(), v.conn.RemoteAddr().String(), v.connectTime})
+	}
+	return d, nil
 }
